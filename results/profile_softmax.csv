@@ -1,0 +1,8 @@
+implementation,step,kernels,gpu_us,bytes_MB
+triton_fused,total,1,407.8,134.2
+naive_pytorch,total,5,1549.9,536.9
+naive_pytorch,max(x),1,216.1,67.1
+naive_pytorch,x - max,1,424.1,134.2
+naive_pytorch,exp(z),1,402.5,134.2
+naive_pytorch,sum(num),1,211.3,67.1
+naive_pytorch,num / den,1,423.9,134.2

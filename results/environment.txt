@@ -1,0 +1,9 @@
+OS: Windows-11-10.0.26300-SP0
+Python: 3.12.14
+GPU: NVIDIA GeForce RTX 5060 Laptop GPU
+Compute capability: (12, 0)
+nvidia-smi (name, driver, memory, max SM clock, max mem clock, power limit): NVIDIA GeForce RTX 5060 Laptop GPU, 610.91, 8151 MiB, 3090 MHz, 12001 MHz, [N/A]
+PyTorch: 2.11.0+cu128
+PyTorch CUDA: 12.8
+cuDNN: 91900
+Triton: 3.6.0

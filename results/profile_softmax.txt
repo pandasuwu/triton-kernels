@@ -1,0 +1,18 @@
+Softmax profile: 4096 x 4096 fp32, NVIDIA GeForce RTX 5060 Laptop GPU
+
+Kernels per call (counted from a captured CUDA graph):
+  Triton fused : 1  softmax_kernel
+  Naive PyTorch: 5  MaxOps, elementwise_kernel, exp_kernel_cuda, func_wrapper, DivFunctor
+
+GPU time per call (triton.testing.do_bench, median):
+  Triton fused :    407.8 us
+  Naive PyTorch:   1549.9 us   (3.80x slower)
+     max(x)        216.1 us     67.1 MB
+     x - max       424.1 us    134.2 MB
+     exp(z)        402.5 us    134.2 MB
+     sum(num)      211.3 us     67.1 MB
+     num / den     423.9 us    134.2 MB
+
+Bytes moved per call (computed from tensor shapes, minimum per kernel):
+  Triton fused :  134.2 MB
+  Naive PyTorch:  536.9 MB   (4.00x)
