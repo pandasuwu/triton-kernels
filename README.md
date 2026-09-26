@@ -1,101 +1,151 @@
 # triton-kernels
 
-Hand-written Triton kernels (vector add, fused softmax, tiled matmul with a fused activation, fused LayerNorm), each tested against PyTorch and benchmarked against PyTorch eager and `torch.compile` on a laptop RTX 5060.
+**Hand-written GPU kernels in Triton, measured head-to-head against PyTorch, cuBLAS and `torch.compile` on a laptop RTX 5060.**
 
-## Environment
+Four kernels, from "hello world" to a tensor-core matmul, each with correctness tests, a benchmark sweep, and comments that explain every line. Everything runs natively on Windows on a Blackwell (sm_120) GPU.
 
-All results in `results/` were produced on this setup (`results/environment.txt`, written by `bench/env_info.py`):
+---
 
-| | |
+## TL;DR
+
+| | Result |
 |---|---|
-| GPU | NVIDIA GeForce RTX 5060 Laptop GPU (Blackwell, compute capability 12.0, 26 SMs, 8 GB, 32 MB L2) |
-| Driver | 610.91 (nvidia-smi reports CUDA 13.3) |
-| CUDA (PyTorch build) | 12.8 |
-| PyTorch | 2.11.0+cu128 |
-| Triton | 3.6.0 (`triton-windows` 3.6.0.post26) |
-| Python | 3.12.14 |
-| OS | Windows 11 (10.0.26300), native, no WSL |
+| Fused softmax vs. naive PyTorch | **3.9x faster** (336 vs 86 GB/s) |
+| Why it is faster | **1 kernel instead of 5, 4x less memory traffic** (134 MB vs 537 MB) |
+| Matmul + GELU, fused vs. unfused | **1.3x faster at 512**, 1.08x at 4096 |
+| Fused LayerNorm vs. `F.layer_norm` (16384 cols) | **345 vs 249 GB/s** |
+| Correctness | **74 / 74 tests passing** against PyTorch |
 
-The laptop was on AC power. The GPU is power-capped (nvidia-smi showed SM clocks from 1357 to 2767 MHz and the software power-cap throttle flag during matmul runs), so repeated runs differ by a few percent.
+Every number here comes from a real run on this machine and lives in [`results/`](results/).
 
-## Layout
+---
+
+## What's inside
+
+| Kernel | What it shows | File |
+|---|---|---|
+| **Vector add** | The basics: program IDs, block offsets, masking the ragged tail | [`kernels/vector_add.py`](kernels/vector_add.py) |
+| **Fused softmax** | Kernel fusion: one read and one write per row, numerically stable, plus an online-softmax path for very long rows | [`kernels/softmax.py`](kernels/softmax.py) |
+| **Matmul + GELU** | Block tiling, grouped ordering for L2 reuse, autotuning, fp16 tensor cores with fp32 accumulation, activation fused into the epilogue | [`kernels/matmul.py`](kernels/matmul.py) |
+| **Fused LayerNorm** | Mean and variance computed in registers in a single pass over memory | [`kernels/layernorm.py`](kernels/layernorm.py) |
+
+For each kernel, [`WALKTHROUGH.md`](WALKTHROUGH.md) covers the idea, the code path and the numbers, with common questions and answers.
+
+---
+
+## The core idea: memory traffic is the bottleneck
+
+Most of these operations do very little math per byte, so speed is set by how many bytes cross the memory bus. Naive PyTorch softmax runs five separate kernels, and each one reads a full matrix from GPU memory and writes one back:
 
 ```
-kernels/   vector_add.py  softmax.py  matmul.py  layernorm.py
-tests/     pytest correctness tests against PyTorch
-bench/     bench_*.py, profile_softmax.py, env_info.py, run_all.py
-results/   CSV + PNG per benchmark, profile output, environment.txt
-WALKTHROUGH.md   per-kernel explanation and interview questions
+naive:  x -> [max] -> [x - max] -> [exp] -> [sum] -> [divide] -> out     5 kernels, 537 MB
+fused:  x -> [load row once, do everything in registers, store once] -> out     1 kernel, 134 MB
 ```
 
-## Running
+Measured on a 4096 x 4096 fp32 matrix:
 
-```
-uv venv --python 3.12
-uv pip install torch --index-url https://download.pytorch.org/whl/cu128
-uv pip install "triton-windows>=3.6,<3.7" numpy pytest matplotlib pandas   # on Linux: triton
-.venv\Scripts\activate
+| | Kernels | Memory moved | GPU time |
+|---|---|---|---|
+| Naive PyTorch | 5 | 536.9 MB | 1550 us |
+| **Triton fused** | **1** | **134.2 MB** | **408 us** |
+| Ratio | 5x | 4.00x | 3.80x |
 
-pytest                     # 74 tests
-python bench/run_all.py    # regenerates everything in results/
-```
+The speedup (3.80x) tracks the traffic reduction (4.00x) almost exactly, which is what you expect from a memory-bound operation.
 
-On Windows, `triton-windows` bundles its own CUDA toolchain and C compiler; only the Visual C++ 2015-2022 redistributable is needed.
+*How this was measured:* `torch.profiler` cannot see the GPU on this machine (CUPTI fails with `CUPTI_ERROR_INVALID_DEVICE`), so each version was captured into a CUDA graph and its kernel nodes were counted. Bytes are computed from tensor shapes, and times come from `triton.testing.do_bench`. Script: [`bench/profile_softmax.py`](bench/profile_softmax.py).
+
+---
 
 ## Results
 
-Timing uses `triton.testing.do_bench` (median, L2 flushed between runs). `torch.compile` uses static shapes.
-
-### Vector add (fp32)
-
-![vector add](results/vector_add.png)
-
-| Elements | Triton | PyTorch eager | torch.compile |
-|---|---|---|---|
-| 2^20 | 336 GB/s | 320 GB/s | 323 GB/s |
-| 2^28 | 345 GB/s | 345 GB/s | 347 GB/s |
-
-All three saturate at about 345 GB/s. Below about 2^18 elements the time is dominated by launch overhead.
+All timings are medians from `triton.testing.do_bench`, with the L2 cache flushed between runs.
 
 ### Fused softmax (fp32, 4096 rows)
 
 ![softmax](results/softmax.png)
 
-| Columns | Triton fused | torch.softmax | Naive PyTorch (5 kernels) | torch.compile(naive) |
+| Columns | **Triton fused** | torch.softmax | Naive PyTorch | torch.compile |
 |---|---|---|---|---|
-| 1024 | 333 GB/s | 335 GB/s | 140 GB/s | 336 GB/s |
-| 4096 | 336 GB/s | 312 GB/s | 86 GB/s | 336 GB/s |
-| 16384 | 335 GB/s | 333 GB/s | 86 GB/s | 339 GB/s |
+| 1024 | **333 GB/s** | 335 | 140 | 336 |
+| 4096 | **336 GB/s** | 312 | 86 | 336 |
+| 16384 | **335 GB/s** | 333 | 86 | 339 |
 
-GB/s is effective bandwidth (one read and one write of the matrix divided by time). The fused kernel is 3.9x faster than the naive version at 4096 columns. `torch.softmax` drops to 230-310 GB/s between 2176 and 4096 columns. At 128 columns the Triton kernel reaches only 181 GB/s against 319 GB/s for `torch.softmax`: one program per 128-element row leaves most of its 4 warps idle.
+The hand-written kernel matches PyTorch's built-in softmax and the `torch.compile` output, and is about 4x faster than the unfused version.
 
-### Matmul + GELU (fp16 in, fp32 accumulate, M = N = K)
+### Matmul + GELU (fp16 in, fp32 accumulate, square matrices)
 
 ![matmul](results/matmul_gelu_fp16.png)
 
-| Size | Triton fused | torch.matmul + GELU | cuBLAS matmul only | torch.compile(matmul + GELU) |
+| Size | **Triton fused** | matmul + GELU (unfused) | cuBLAS matmul only | torch.compile |
 |---|---|---|---|---|
-| 512 | 15.8 TFLOPS | 12.2 TFLOPS | 15.3 TFLOPS | 12.1 TFLOPS |
-| 2048 | 32.8 TFLOPS | 31.4 TFLOPS | 32.4 TFLOPS | 32.2 TFLOPS |
-| 4096 | 32.5 TFLOPS | 30.0 TFLOPS | 29.5 TFLOPS | 31.0 TFLOPS |
+| 512 | **15.8 TFLOPS** | 12.2 | 15.3 | 12.1 |
+| 2048 | **32.8 TFLOPS** | 31.4 | 32.4 | 32.2 |
+| 4096 | **32.5 TFLOPS** | 30.0 | 29.5 | 31.0 |
 
-TFLOPS counts the 2*M*N*K matmul FLOPs only. The fused kernel is 1.08x faster than the unfused PyTorch version at 4096 and 1.3x at 512. `@triton.autotune` chooses among 6 tile configurations per shape. Inductor printed "Not enough SMs to use max_autotune_gemm mode", so `torch.compile` keeps the cuBLAS matmul and adds a separate fused activation kernel; it does not fuse GELU into the GEMM.
+The Triton kernel is roughly level with cuBLAS on this GPU and beats the unfused PyTorch version at every size. `torch.compile` does *not* fuse GELU into the matmul here: its generated code is a cuBLAS call followed by a separate GELU kernel.
 
-The "cuBLAS only" line falling below "cuBLAS + GELU" at 3840-4096 appeared in both full sweeps. A standalone re-measurement at 4096 gave cuBLAS 32.9-34.1 TFLOPS, so the dip comes from the GPU's power/clock state during the sweep, not from cuBLAS itself. Treat differences of a few percent at large sizes as noise.
-
-### LayerNorm forward (fp16, 4096 rows)
+### Fused LayerNorm (fp16, 4096 rows)
 
 ![layernorm](results/layernorm_fp16.png)
 
-| Columns | Triton fused | F.layer_norm | Naive PyTorch | torch.compile(naive) |
+| Columns | **Triton fused** | F.layer_norm | Naive PyTorch | torch.compile |
 |---|---|---|---|---|
-| 256 | 176 GB/s | 132 GB/s | 41 GB/s | 315 GB/s |
-| 4096 | 332 GB/s | 322 GB/s | 42 GB/s | 332 GB/s |
-| 16384 | 345 GB/s | 249 GB/s | 37 GB/s | 340 GB/s |
+| 256 | 176 GB/s | 132 | 41 | 315 |
+| 4096 | **332 GB/s** | 322 | 42 | 332 |
+| 16384 | **345 GB/s** | 249 | 37 | 340 |
 
-## Profiling: fused vs unfused softmax
+### Vector add (fp32)
 
-Nsight Compute is not installed, and `torch.profiler` records no GPU activity on this machine (CUPTI fails with `CUPTI_ERROR_INVALID_DEVICE`). `bench/profile_softmax.py` therefore captures one call of each implementation into a CUDA graph and counts the kernel nodes, times each step with `do_bench`, and computes bytes from the tensor shapes each kernel reads and writes. For a 4096 x 4096 fp32 input, the fused Triton softmax runs 1 kernel in 408 us and moves 134.2 MB. The naive PyTorch version runs 5 kernels (max, subtract, exp, sum, divide) in 1550 us and moves 536.9 MB. That is 4.00x the bytes for a 3.80x slowdown, consistent with both versions being memory bound. Full output: `results/profile_softmax.txt`.
+![vector add](results/vector_add.png)
+
+All three implementations reach the same ceiling, about **345 GB/s**, the practical memory bandwidth of this GPU (2^28 elements: Triton 345, eager 345, compile 347 GB/s). That ceiling is the reference point for the other memory-bound kernels.
+
+---
+
+## Lessons learned
+
+- **Fusion beats cleverness for memory-bound ops.** Removing intermediate tensors gave the biggest wins.
+- **Fusion helps matmul most at small sizes.** A large matmul is limited by compute, so saving one pass over the output matters less as N grows.
+- **`torch.compile` is a strong baseline.** It matched the hand-written softmax and LayerNorm. Writing kernels by hand pays off where the compiler does not fuse, as with the matmul epilogue here.
+- **Short rows are my kernels' weak spot.** With one row per program, a 128-column softmax leaves most threads idle: 181 GB/s against 319 for `torch.softmax`. Packing several rows into each program is the next improvement.
+- **Laptop GPUs are noisy to benchmark.** The power cap moves clocks between 1357 and 2767 MHz, so differences of a few percent at large sizes are noise. For example, cuBLAS-only reads 29.5 TFLOPS at 4096 in the sweep but 33-34 TFLOPS measured on its own.
+
+---
+
+## Quickstart
+
+```
+uv venv --python 3.12
+uv pip install torch --index-url https://download.pytorch.org/whl/cu128
+uv pip install "triton-windows>=3.6,<3.7" numpy pytest matplotlib pandas   # Linux: triton
+.venv\Scripts\activate
+
+pytest                     # 74 correctness tests
+python bench/run_all.py    # regenerates every CSV, plot and profile in results/
+```
+
+On Windows, `triton-windows` bundles its own CUDA toolchain and compiler. Only the Visual C++ 2015-2022 redistributable is required.
+
+## Project layout
+
+```
+kernels/          the four Triton kernels (commented line by line)
+tests/            pytest correctness tests vs PyTorch
+bench/            benchmark sweeps, softmax profiling, run_all.py
+results/          CSVs, plots, profile output, environment.txt
+WALKTHROUGH.md    deep dive per kernel
+```
+
+## Environment
+
+| | |
+|---|---|
+| GPU | NVIDIA GeForce RTX 5060 Laptop GPU (Blackwell, sm_120, 26 SMs, 8 GB, 32 MB L2) |
+| Driver | 610.91 (CUDA 13.3) |
+| PyTorch | 2.11.0+cu128 |
+| Triton | 3.6.0 (`triton-windows` 3.6.0.post26) |
+| Python | 3.12.14 |
+| OS | Windows 11, native (no WSL), on AC power |
 
 ## Notes
 
